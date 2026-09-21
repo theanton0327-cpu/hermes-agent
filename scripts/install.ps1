@@ -77,6 +77,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Exit code for an intentional, fail-closed refusal (see the replace-tree
+# preflight in Install-Repository). Stays 0 for every other path, so the
+# top-level catch only forces a non-zero exit for an abort WE raised.
+$script:_InstallAbortExitCode = 0
+
 # Suppress Invoke-WebRequest's per-chunk progress bar.  Windows PowerShell
 # 5.1's progress UI repaints synchronously on every received byte, which
 # pegs CPU on a single core and throttles downloads by 10-100x (a 57MB
@@ -2231,6 +2236,227 @@ function Install-SystemPackages {
 }
 
 # ============================================================================
+# Replace-tree preflight (2026-09-21 incident)
+# ============================================================================
+#
+# What went wrong: Install-Repository moved the whole tree aside
+# (`$InstallDir.broken-<stamp>`) while the desktop App was still running, then
+# could not reach GitHub (os error 10054) and left a half-installed tree behind
+# (venv without pip, .git unusable). The running renderer survived the rename
+# until its first lazy import, then died on
+#
+#   TypeError: Failed to fetch dynamically imported module:
+#   .../app.asar.unpacked/dist/assets/settings-CAEmhRvA.js
+#
+# and the 04:30 upgrade chain plus the Feishu push chain were dead until
+# someone noticed hours later.
+#
+# These two gates run BEFORE the rename, so the old tree stays usable when
+# either one refuses:
+#   1. no Hermes desktop / backend / electron process is alive in the tree
+#   2. GitHub is actually reachable for the clone that is about to happen
+#
+# Both are additive: they gate only the replace-tree branch, and each has an
+# explicit escape hatch (see the env flags at the call site).
+
+function Test-InstallEnvFlag {
+    # Truthy-env-var reader. Env vars rather than new switches: install.ps1 is
+    # delivered via `irm | iex` and driven by several callers (Tauri bootstrap,
+    # desktop bootstrap-runner, hermes update), so a new parameter would have to
+    # be threaded through every one of them to be usable.
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    $value = [Environment]::GetEnvironmentVariable($Name)
+
+    if (-not $value) { return $false }
+
+    return @('1', 'true', 'yes', 'on') -contains $value.Trim().ToLowerInvariant()
+}
+
+function Get-HermesTreeHolder {
+    # Live processes executing out of $InstallDir -- the desktop App itself,
+    # its Electron children (renderer/GPU/utility all run the same exe under
+    # apps\desktop\release\win-unpacked\), and the Python backend under venv\.
+    # Renaming the tree under any of them is what made the chunks vanish.
+    #
+    # Matched by EXECUTABLE PATH only. CommandLine matching is deliberately not
+    # used: the PowerShell running install.ps1 carries the tree path in its own
+    # command line, so every install would refuse itself.
+    #
+    # The installer's own ancestor chain is exempt (a `hermes update` CLI or
+    # the desktop bootstrap's PowerShell legitimately sits in that chain). The
+    # desktop app and the venv backend are exempt ONLY when they are not the
+    # blocker -- and they always are, because their exe lives under
+    # apps\desktop\ or venv\, which is checked before the exemption. Swapping
+    # the tree while the App drives the install is exactly the bug.
+    param([Parameter(Mandatory = $true)][string]$InstallDir)
+
+    $root = [System.IO.Path]::GetFullPath($InstallDir).TrimEnd('\')
+    $treePrefix = $root + '\'
+    $desktopPrefix = $root + '\apps\desktop\'
+    $venvPrefix = $root + '\venv\'
+
+    $exempt = New-Object 'System.Collections.Generic.HashSet[int]'
+    [void]$exempt.Add($PID)
+    $cursor = $PID
+
+    for ($hop = 0; $hop -lt 12; $hop++) {
+        $parent = 0
+
+        try {
+            $probe = Get-CimInstance Win32_Process -Filter "ProcessId = $cursor" -ErrorAction Stop
+            if ($probe) { $parent = [int]$probe.ParentProcessId }
+        } catch { break }
+
+        if ($parent -le 0) { break }
+        if (-not $exempt.Add($parent)) { break }
+
+        $cursor = $parent
+    }
+
+    try {
+        $cmp = [System.StringComparison]::OrdinalIgnoreCase
+
+        return @(
+            Get-CimInstance Win32_Process -ErrorAction Stop |
+                Where-Object {
+                    $exe = $_.ExecutablePath
+
+                    # Unreadable (another session / elevated) -- skip rather
+                    # than abort the sweep, same contract as the venv sweep.
+                    if (-not $exe) { return $false }
+
+                    # Win32_Process reports the 8.3 SHORT form when the profile
+                    # path needs one (C:\Users\ADMINI~1\...) while GetFullPath
+                    # above returns the LONG form. Comparing them directly never
+                    # matches -- and this guard would then fail OPEN, silently
+                    # allowing the exact rename the incident was. Normalize the
+                    # process path too; GetFullPath expands 8.3 even when the
+                    # file no longer exists (the rename-aside case).
+                    try { $exe = [System.IO.Path]::GetFullPath($exe) } catch { }
+
+                    if (-not $exe.StartsWith($treePrefix, $cmp)) { return $false }
+
+                    $isHardBlocker = $exe.StartsWith($desktopPrefix, $cmp) -or $exe.StartsWith($venvPrefix, $cmp)
+                    if ($isHardBlocker) { return $true }
+
+                    return -not $exempt.Contains([int]$_.ProcessId)
+                } |
+                ForEach-Object {
+                    [pscustomobject]@{
+                        ProcessId = $_.ProcessId
+                        Name      = $_.Name
+                        Path      = $_.ExecutablePath
+                    }
+                }
+        )
+    } catch {
+        Write-Warn "Could not enumerate processes holding ${InstallDir}: $($_.Exception.Message)"
+        return @()
+    }
+}
+
+function Test-TcpReachable {
+    # Dependency-free reachability probe, used when no git binary is available
+    # (the clone stage falls back to the ZIP download, so the host is what
+    # matters, not git). ConnectAsync + Wait keeps a blackholed route from
+    # hanging the installer the way a bare Connect() would.
+    param(
+        [Parameter(Mandatory = $true)][string]$HostName,
+        [Parameter(Mandatory = $true)][int]$Port,
+        [int]$TimeoutSeconds = 8
+    )
+
+    $client = New-Object System.Net.Sockets.TcpClient
+
+    try {
+        $async = $client.BeginConnect($HostName, $Port, $null, $null)
+
+        if (-not $async.AsyncWaitHandle.WaitOne($TimeoutSeconds * 1000, $false)) {
+            return @{ Ok = $false; Reason = "TCP connect to ${HostName}:${Port} timed out after ${TimeoutSeconds}s" }
+        }
+
+        $client.EndConnect($async)
+
+        return @{ Ok = $true; Reason = "TCP ${HostName}:${Port} reachable" }
+    } catch {
+        return @{ Ok = $false; Reason = "TCP connect to ${HostName}:${Port} failed: $($_.Exception.Message)" }
+    } finally {
+        $client.Close()
+    }
+}
+
+function Test-GitHubReachable {
+    # Fail-closed preflight for the clone that follows the tree swap. `git
+    # ls-remote` is the faithful probe -- it performs the same HTTPS handshake
+    # and auth as the clone -- run through a bounded Process wait so a stalled
+    # connection reports instead of hanging. GIT_TERMINAL_PROMPT=0 keeps it
+    # from blocking on a credential prompt.
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoUrl,
+        [string]$Branch = "main",
+        [int]$TimeoutSeconds = 20
+    )
+
+    $gitCmd = Get-Command git -ErrorAction SilentlyContinue
+
+    if (-not $gitCmd) {
+        return Test-TcpReachable -HostName 'github.com' -Port 443 -TimeoutSeconds 8
+    }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $gitCmd.Source
+    $psi.Arguments = "-c windows.appendAtomically=false ls-remote --heads `"$RepoUrl`" `"$Branch`""
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables['GIT_TERMINAL_PROMPT'] = '0'
+    $psi.EnvironmentVariables['GIT_SSH_COMMAND'] = 'ssh -o BatchMode=yes -o ConnectTimeout=5'
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+
+    try {
+        if (-not $proc.Start()) {
+            return @{ Ok = $false; Reason = "could not start git ls-remote" }
+        }
+
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+
+        if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+            try { $proc.Kill() } catch { }
+
+            return @{ Ok = $false; Reason = "git ls-remote timed out after ${TimeoutSeconds}s" }
+        }
+
+        # Flush the async readers before reading their results.
+        $proc.WaitForExit()
+
+        $stdout = $stdoutTask.Result
+        $stderr = $stderrTask.Result
+
+        if ($proc.ExitCode -ne 0) {
+            $why = ($stderr -split "`r?`n" | Where-Object { $_ -and $_.Trim() } | Select-Object -First 1)
+            if (-not $why) { $why = "exit code $($proc.ExitCode)" }
+
+            return @{ Ok = $false; Reason = "git ls-remote failed: $why" }
+        }
+
+        if (-not ($stdout -match '\S')) {
+            return @{ Ok = $false; Reason = "git ls-remote returned no refs for '$Branch'" }
+        }
+
+        return @{ Ok = $true; Reason = "git ls-remote resolved $RepoUrl ($Branch)" }
+    } catch {
+        return @{ Ok = $false; Reason = "git ls-remote errored: $($_.Exception.Message)" }
+    } finally {
+        $proc.Dispose()
+    }
+}
+
+# ============================================================================
 # Installation
 # ============================================================================
 
@@ -2466,6 +2692,72 @@ function Install-Repository {
             # installer into the "update" branch forever. Move it aside rather
             # than deleting it -- never destroy a directory the user might still
             # want -- and fall through to a fresh clone.
+            #
+            # Both gates below run BEFORE the rename. If either refuses, the
+            # directory is left exactly where it is: the old tree stays usable
+            # and the next attempt starts from the same place. Nothing has been
+            # isolated, renamed or deleted.
+            #
+            # Escape hatches (additive -- default behaviour is fail-closed):
+            #   HERMES_INSTALL_ALLOW_RUNNING_APP=1  swap with a live app anyway
+            #                                       (only if you know it is idle)
+            #   HERMES_INSTALL_SKIP_GITHUB_PREFLIGHT=1  skip the reachability probe
+            $treeHolders = @(Get-HermesTreeHolder -InstallDir $InstallDir)
+
+            if ($treeHolders.Count -gt 0 -and -not (Test-InstallEnvFlag -Name 'HERMES_INSTALL_ALLOW_RUNNING_APP')) {
+                # U+8BF7 U+5148 U+9000 U+51FA U+684C U+9762 + " App" reads
+                # "please quit the desktop App" in Chinese.
+                # Built from code points because this file must stay PURE ASCII:
+                # PowerShell 5.1 parses a BOM-less .ps1 as ANSI, so a literal
+                # UTF-8 CJK string would be mis-decoded into stray quotes and
+                # braces and break the parser (see the encoding note above).
+                $quitAppZh = (-join @([char]0x8BF7, [char]0x5148, [char]0x9000, [char]0x51FA, [char]0x684C, [char]0x9762)) + " App"
+
+                Write-Err "Hermes is still running out of $InstallDir -- refusing to replace the tree."
+                Write-Host ""
+                Write-Host ("  {0} -- quit the desktop app (and its backend / Electron children), then re-run." -f $quitAppZh)
+                Write-Host ""
+                foreach ($holder in $treeHolders) {
+                    Write-Host ("  - PID {0}  {1}" -f $holder.ProcessId, $holder.Path)
+                }
+                Write-Host ""
+                Write-Info "Renaming the tree under a live app is what leaves the desktop UI"
+                Write-Info "blank with 'Failed to fetch dynamically imported module'. Nothing was"
+                Write-Info "moved or deleted -- this directory is untouched."
+                Write-Info "Set HERMES_INSTALL_ALLOW_RUNNING_APP=1 to override."
+
+                # Non-zero exit: the interactive top-level catch prints and would
+                # otherwise fall through with exit code 0.
+                $script:_InstallAbortExitCode = 3
+                throw "Hermes desktop/backend processes are still running from $InstallDir"
+            }
+
+            if (-not (Test-InstallEnvFlag -Name 'HERMES_INSTALL_SKIP_GITHUB_PREFLIGHT')) {
+                Write-Info "Checking GitHub reachability before replacing the tree..."
+
+                $reachable = Test-GitHubReachable -RepoUrl $RepoUrlHttps -Branch $Branch
+
+                if (-not $reachable.Ok) {
+                    Write-Err "Cannot reach GitHub ($($reachable.Reason))."
+                    Write-Host ""
+                    Write-Host "  Tree replacement aborted. The old directory was NOT renamed, moved"
+                    Write-Host "  or isolated -- it is untouched and still usable."
+                    Write-Host ""
+                    Write-Info "Moving the tree aside and THEN failing to clone is what produced a"
+                    Write-Info "half-installed tree (venv without pip, .git unusable). The previous"
+                    Write-Info "directory was left intact so the existing install keeps working."
+                    Write-Info "Check your network / proxy / VPN, then re-run the installer."
+                    Write-Info "Set HERMES_INSTALL_SKIP_GITHUB_PREFLIGHT=1 to override."
+
+                    $script:_InstallAbortExitCode = 4
+                    throw "GitHub is unreachable; refusing to replace $InstallDir"
+                }
+
+                Write-Info "GitHub reachable ($($reachable.Reason))"
+            } else {
+                Write-Warn "HERMES_INSTALL_SKIP_GITHUB_PREFLIGHT=1 -- skipping the GitHub reachability check."
+            }
+
             $backupDir = "$InstallDir.broken-" + (Get-Date -Format "yyyyMMdd-HHmmss")
             Write-Warn "Existing directory at $InstallDir is not a valid git repo."
             Write-Warn "Moving it aside to $backupDir before re-cloning."
@@ -5168,4 +5460,13 @@ try {
     Write-Host "  Invoke-WebRequest -Uri 'https://hermes-agent.nousresearch.com/install.ps1' -OutFile install.ps1" -ForegroundColor Yellow
     Write-Host "  .\install.ps1" -ForegroundColor Yellow
     Write-Host ""
+
+    # A refuse-to-replace-tree abort (see the preflight in Install-Repository)
+    # must report a NON-ZERO exit code -- `hermes update`, the Tauri bootstrap
+    # and the desktop bootstrap-runner all branch on it. Without this the
+    # friendly interactive recovery path above would end the script on the last
+    # Write-Host and exit 0, reporting a refused update as success.
+    if ($script:_InstallAbortExitCode -and $script:_InstallAbortExitCode -ne 0) {
+        exit $script:_InstallAbortExitCode
+    }
 }

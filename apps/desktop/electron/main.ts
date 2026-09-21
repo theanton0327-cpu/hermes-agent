@@ -170,6 +170,7 @@ import {
   upsertConnection
 } from './connection-registry'
 import type { RosterProfileMetadata } from './connection-registry'
+import { createCrashAlerter, createErrorsLogSink } from './crash-alert'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
@@ -306,6 +307,7 @@ import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import { LEGACY_OAUTH_PARTITION, resolveOauthPartition } from './oauth-partition'
 import { mintGatewayWsTicket as mintOauthGatewayWsTicket, requestWithOauthFallback } from './oauth-rest-request'
 import { wireOauthSessionResponse } from './oauth-session-response'
+import { hermesSendCandidates, notifyOps } from './ops-alert'
 import { createParentStartMarkerResolver, parentWatchdogEnv } from './parent-process-identity'
 import { registerPetOverlayIpc } from './pet-overlay-ipc'
 import {
@@ -1973,6 +1975,86 @@ function rememberLog(chunk) {
 }
 
 installCrashForensics({ flush: flushDesktopLogBufferSync, log: rememberLog })
+
+// errors.log sits next to desktop.log and is the file `hermes logs errors`
+// already reads (hermes_logging writes WARNING+ there from the Python side).
+// A desktop-side renderer/startup fault landing in the same file is what makes
+// the 2026-09-21 class of failure discoverable without a desktop.log dig.
+const ERRORS_LOG_PATH = path.join(HERMES_HOME, 'logs', 'errors.log')
+// Push budget per app run. A renderer crash loop reloads a bounded number of
+// times before the repair page; the alerter dedupes by fingerprint on top.
+const CRASH_ALERT_MAX_PER_RUN = 3
+const crashAlertsDisabled = process.env.HERMES_DESKTOP_CRASH_ALERTS === '0'
+const appendErrorsLog = createErrorsLogSink({
+  file: ERRORS_LOG_PATH,
+  appendFile: (file, data) => fs.appendFileSync(file, data),
+  mkdirSync: (dir, options) => fs.mkdirSync(dir, options),
+  statSync: file => fs.statSync(file),
+  renameSync: (from, to) => fs.renameSync(from, to),
+  dirname: path.dirname
+})
+const crashAlerter = createCrashAlerter({
+  write: appendErrorsLog,
+  host: os.hostname(),
+  maxAlerts: CRASH_ALERT_MAX_PER_RUN,
+  // Best-effort and out-of-band: `hermes send` reuses whatever alert platform
+  // the user already configured (Feishu by default). HERMES_DESKTOP_ALERT_TO
+  // overrides the target, HERMES_DESKTOP_CRASH_ALERTS=0 silences the push
+  // (errors.log still gets the line).
+  notify: crashAlertsDisabled
+    ? () => {}
+    : message =>
+        void notifyOps(message, {
+          spawn: (file, args, options) => spawn(file, args, options as any),
+          candidates: hermesSendCandidates({
+            installRoot: resolveUpdateRoot(),
+            hermesHome: HERMES_HOME,
+            isWindows: IS_WINDOWS,
+            join: path.join
+          }),
+          exists: fileExists,
+          target: process.env.HERMES_DESKTOP_ALERT_TO || 'feishu',
+          env: { ...process.env, HERMES_HOME }
+        })
+})
+
+// Which surface a webContents belongs to, for the alert. Every Hermes window
+// carries its kind in the URL (`?win=overlay#/`, `?win=quick#/` — see the
+// window factories); anything else reports Electron's own type.
+function rendererWindowLabel(webContents: any): string {
+  try {
+    const raw = String(webContents?.getURL?.() || '')
+    const kind = /[?&]win=([a-z0-9_-]+)/i.exec(raw)?.[1]
+
+    if (kind) {
+      return kind
+    }
+
+    return String(webContents?.getType?.() || 'window')
+  } catch {
+    return 'window'
+  }
+}
+
+// Pure hook: every renderer teardown already logs through
+// installWindowRendererLifecycle. This adds the errors.log line + push for the
+// kill/crash reasons a user must hear about, WITHOUT touching that logic.
+app.on('render-process-gone', (_event, webContents, details) => {
+  const reason = String(details?.reason || 'unknown')
+
+  // An ordinary teardown (window closed, app quitting, handoff) is not a
+  // fault and must not page anyone.
+  if (reason === 'clean-exit' || isQuittingForHandoff || backendShutdown.hasStarted()) {
+    return
+  }
+
+  crashAlerter.report({
+    kind: reason === 'crashed' || reason === 'oom' ? 'renderer-crashed' : 'renderer-gone',
+    label: rendererWindowLabel(webContents),
+    reason,
+    exitCode: details?.exitCode
+  })
+})
 
 // A rejected loadURL leaves a blank window and, unhandled, no trace anywhere
 // the user can send us. `label` names the surface so the log says which one.
@@ -15012,6 +15094,13 @@ function createWindow() {
           repairHint: 'hermes desktop --force-build',
           reloadUrl: DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString()
         })
+        crashAlerter.report({
+          kind: 'renderer-load-failed',
+          label: 'main',
+          errorCode: details?.errorCode,
+          url: details?.url,
+          missingAssets: missingRendererAssets(resolveRendererIndex())
+        })
       },
       // #116472: the OS/Chromium can SIGKILL a renderer while the window is live (memory
       // reclaim, an external kill). Hermes never does this itself and never reloads it
@@ -15033,6 +15122,15 @@ function createWindow() {
             `The desktop UI process was terminated unexpectedly (reason: ${reason}${exit}). ` +
             'Your sessions and the background gateway are unaffected — reload to continue.',
           reloadUrl: DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString()
+        })
+        crashAlerter.report({
+          kind: 'renderer-gone',
+          label: 'main',
+          reason,
+          exitCode: details?.exitCode,
+          // A rename-aside install makes these the actionable half of the
+          // report: the tree the renderer was loading from is gone.
+          missingAssets: DEV_SERVER ? [] : missingRendererAssets(resolveRendererIndex())
         })
       }
     },
@@ -15070,6 +15168,16 @@ function createWindow() {
       missingAssets: tornAssets,
       repairHint: 'hermes desktop --force-build',
       reloadUrl: pathToFileURL(rendererIndex).toString()
+    })
+    // The 2026-09-21 fingerprint, caught at boot instead of at the first lazy
+    // import: the tree was swapped out from under a running app and the
+    // renderer's chunks went with it.
+    crashAlerter.report({
+      kind: 'bundle-torn',
+      label: 'main',
+      url: rendererIndex,
+      missingAssets: tornAssets,
+      detail: 'renderer bundle is incomplete at launch — the install tree was likely replaced while the app was running'
     })
   } else {
     loadWindowUrl(
